@@ -1558,6 +1558,396 @@ pub struct AuthorizedAccess<'a, 'b> {
     permissions: &'b Permissions,
 }
 
+fn systemtime_to_millis(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn parse_history_json(msg: &str, path: &str) -> Result<Datapoint, ReadError> {
+    use serde_json::Value;
+    use std::time::{UNIX_EPOCH, Duration};
+    let v: Value = serde_json::from_str(msg)
+        .map_err(|_| ReadError::NotFound)?;
+
+    let ts = v.get("ts")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| ReadError::NotFound)?;
+
+    let val = v.get(path)
+        .and_then(|x| x.as_f64())
+        .ok_or_else(|| ReadError::NotFound)?;
+
+    let system_ts = UNIX_EPOCH + Duration::from_millis(ts);
+
+    Ok(Datapoint {
+        ts: system_ts.into(), 
+        source_ts: system_ts.into(),
+        value: DataValue::Double(val),
+    })
+
+}
+
+
+use rumqttc::{AsyncClient, Event, MqttOptions, QoS};
+
+impl From<rumqttc::ClientError> for ReadError {
+    fn from(_: rumqttc::ClientError) -> Self {
+        ReadError::NotFound
+    }
+}
+
+impl From<rumqttc::ConnectionError> for ReadError {
+    fn from(_: rumqttc::ConnectionError) -> Self {
+        ReadError::NotFound
+    }
+}
+
+use rumqttc::Packet;
+
+/// Subscribe to topic and call callback(msg)
+pub async fn mqtt_subscribe<F>(topic: &str, callback: F) -> Result<(), ReadError>
+where
+    F: Fn(String) + Send + Sync + 'static,
+{
+    let id = format!("subscriber-{}", uuid::Uuid::new_v4());
+    let mut mqttoptions = MqttOptions::new(id, "127.0.0.1", 1883);
+    mqttoptions.set_keep_alive(Duration::from_secs(10));
+
+    let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
+
+    // Run eventloop in background
+    let cb = std::sync::Arc::new(callback);
+
+    tokio::spawn({
+        let mut eventloop = eventloop;
+        let cb = cb.clone();
+
+        async move {
+            loop {
+                match eventloop.poll().await {
+                    Ok(Event::Incoming(Packet::Publish(p))) => {
+                        print!("Received on topic {}: {:?}\n", p.topic, p.payload);
+                        if let Ok(msg) = String::from_utf8(p.payload.to_vec()) {
+                            cb(msg);
+                        }
+                    }
+                    Ok(_) => {} // handle other packets normally
+                    Err(e) => {
+                        eprintln!("MQTT error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            // TODO unsubscribe && disconnect when done
+        }
+    });
+
+    // Allow eventloop to initialize
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Subscribe after eventloop started
+    client.subscribe(topic, QoS::AtMostOnce).await?;
+    print!("Subscribed to topic: {}\n", topic);
+
+    Ok(())
+}
+
+pub async fn mqtt_publish(topic: &str, payload: &str) -> Result<(), ReadError> {
+    let mut mqttoptions = MqttOptions::new("publisher", "localhost", 1883);
+    mqttoptions.set_keep_alive(Duration::from_secs(5));
+
+    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+
+    // 启动 eventloop
+    let ev = tokio::spawn(async move {
+        while let Ok(_) = eventloop.poll().await {}
+    });
+
+    // publish
+    client.publish(topic, QoS::AtLeastOnce, false, payload).await?;
+
+    // 等待发送
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 断开 eventloop
+    ev.abort();
+
+    Ok(())
+}
+
+use tokio::sync::Mutex;
+
+
+#[derive(Clone)]
+pub struct MqttHandle {
+    client: AsyncClient,
+    eventloop: Arc<Mutex<rumqttc::EventLoop>>,
+}
+
+impl MqttHandle {
+    /// 创建单个 client + eventloop
+    pub async fn new(client_id: &str, host: &str, port: u16) -> Self {
+        let mut mqttoptions = MqttOptions::new(client_id, host, port);
+        mqttoptions.set_keep_alive(Duration::from_secs(10));
+
+        let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
+        let eventloop = Arc::new(Mutex::new(eventloop));
+
+        // 启动后台任务处理所有 incoming packet
+        // let eventloop_clone = eventloop.clone();
+        // tokio::spawn(async move {
+        //     loop {
+        //         let mut evl = eventloop_clone.lock().await;
+        //         match evl.poll().await {
+        //             Ok(Event::Incoming(Packet::Publish(p))) => {
+        //                 println!("Received on topic {}: {:?}", p.topic, p.payload);
+        //                 // 注意：这里没有 callback, 回调可以在 mqtt_subscribe 时注册
+        //             }
+        //             Ok(_) => {}
+        //             Err(e) => {
+        //                 eprintln!("MQTT error: {:?}", e);
+        //                 break;
+        //             }
+        //         }
+        //     }
+        // });
+
+        Self { client, eventloop }
+    }
+
+    pub async fn subscribe<F>(&self, topic: &str, callback: F) -> Result<(), rumqttc::ClientError>
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        // // 方法 1
+        // // Run eventloop in background
+        // let cb = std::sync::Arc::new(callback);
+        // let eventloop_arc = self.eventloop.clone();
+
+        // tokio::spawn({
+        //     let mut eventloop = eventloop_arc;
+        //     let cb = cb.clone();
+
+        //     async move {
+        //         loop {
+        //             match eventloop.poll().await {
+        //                 Ok(Event::Incoming(Packet::Publish(p))) => {
+        //                     print!("Received on topic {}: {:?}\n", p.topic, p.payload);
+        //                     if let Ok(msg) = String::from_utf8(p.payload.to_vec()) {
+        //                         cb(msg);
+        //                     }
+        //                 }
+        //                 Ok(_) => {} // handle other packets normally
+        //                 Err(e) => {
+        //                     eprintln!("MQTT error: {:?}", e);
+        //                     break;
+        //                 }
+        //             }
+        //         }
+        //         // TODO unsubscribe && disconnect when done
+        //     }
+        // });
+
+        // // Allow eventloop to initialize
+        // tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // // Subscribe after eventloop started
+        // self.client.subscribe(topic, QoS::AtMostOnce).await?;
+        // print!("Subscribed to topic: {}\n", topic);
+
+        // Ok(())
+
+
+
+
+
+        // 方法 2
+
+
+
+
+        let cb = Arc::new(callback);
+        let topic = topic.to_string();
+    
+        // 订阅
+        self.client.subscribe(&topic, QoS::AtMostOnce).await?;
+        println!("Subscribed to topic: {}", topic);
+    
+        // 克隆 callback
+        let cb_clone = cb.clone();
+    
+        // 克隆 Arc<Mutex<EventLoop>>
+        let eventloop_arc = self.eventloop.clone();
+    
+        // 启动后台任务
+        tokio::spawn(async move {
+            loop {
+                // 在 task 内部重新 lock
+                let mut evl = eventloop_arc.lock().await;
+                println!("Waiting for messages on topic: {}", topic);
+    
+                match evl.poll().await {
+                    Ok(Event::Incoming(Packet::Publish(p))) => {
+                        println!("Received on topic {}: {:?}\n", p.topic, p.payload);
+                        if p.topic == topic {
+                            if let Ok(msg) = String::from_utf8(p.payload.to_vec()) {
+                                cb_clone(msg);
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("MQTT error in subscribe task: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        });
+    
+        Ok(())
+    }
+    
+
+    /// Publish a message
+    pub async fn publish(&self, topic: &str, payload: &str) -> Result<(), rumqttc::ClientError> {
+        self.client
+            .publish(topic, QoS::AtLeastOnce, false, payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Disconnect
+    pub async fn disconnect(&self) -> Result<(), rumqttc::ClientError> {
+        self.client.disconnect().await
+    }
+}
+
+
+
+
+
+
+
+
+/// Publish MQTT Message
+// pub async fn mqtt_publish(topic: &str, payload: &str) -> Result<(), ReadError> {
+//     let mut mqttoptions = MqttOptions::new("publisher", "localhost", 1883);
+//     mqttoptions.set_keep_alive(Duration::from_secs(10));
+// 
+//     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+//     println!("Publishing to topic: {} payload: {}", topic, payload);
+// 
+//     client
+//         .publish(topic, QoS::AtLeastOnce, false, payload)
+//         .await?;
+// 
+//     println!("Publishing to topic: {} payload: {}", topic, payload);
+//     // Run eventloop for at least one cycle to flush messages
+//     tokio::spawn(async move {
+//         let _ = eventloop.poll().await;
+//     });
+//     println!("Publishing to topic: {} payload: {}", topic, payload);
+// 
+//     Ok(())
+// }
+
+use std::time::UNIX_EPOCH;
+use std::sync::atomic::{AtomicBool};
+
+static IS_FIRST: AtomicBool = AtomicBool::new(false);
+
+impl<'a, 'b> AuthorizedAccess<'a, 'b> {
+    pub async fn get_history(
+        &self,
+        path: &str,
+        start: std::time::SystemTime,
+        end: std::time::SystemTime,
+    ) -> Result<Vec<Datapoint>, ReadError>  {
+        // TODO: if first trigger get history
+        // call ensure_trigger_stream_and_rule
+        if !IS_FIRST.load(Ordering::Acquire) {
+            IS_FIRST.store(true, Ordering::Release);
+            let _ = ensure_trigger_stream_and_rule().await;
+            println!("IS_FIRST is true");
+        } else {
+            println!("IS_FIRST is false");
+        }
+        
+
+        let mut results = Vec::new();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        // topic: history/<path>
+        let topic = format!("history/{}", path);
+
+        let mqtt = MqttHandle::new("databroker", "127.0.0.1", 1883).await;
+
+        mqtt_subscribe(&topic, move |msg| {
+            let _ = tx.send(msg);
+        }).await?;
+
+        // let json = build_rule_json(path, path, true).unwrap();
+        // print!("Sending rule to ekuiper: {}\n", json);
+        // println!("Sending rule to ekuiper for history data request\n");
+
+        // let _ = send_rule_to_ekuiper(&json).await;
+        let _ = send_rule_to_ekuiper().await;
+        println!("Rule sent to ekuiper for history data request\n");
+
+
+        // TODO mqtt pub to -t trigger -m '{"ts1":start, "ts2": end}'
+        // sub client will receive the history datapoints json payload from ekuiper
+        // like below:
+        // {"Vehicle.Acceleration.Longitudinal":0.001,"ts":1756452096710}
+        // {"Vehicle.Acceleration.Longitudinal":0.002,"ts":1756452096730}
+        // {"Vehicle.Acceleration.Longitudinal":0.003,"ts":1756452096740}
+        // {"Vehicle.Acceleration.Longitudinal":0.003,"ts":1756452096750}
+        // {"Vehicle.Acceleration.Longitudinal":0.001,"ts":1756452096760}
+        // convert it to datapoint vector and return
+
+        let start_ms = systemtime_to_millis(start);
+        let end_ms   = systemtime_to_millis(end);
+
+        let trigger_payload = serde_json::json!({
+            "ts1": start_ms,
+            "ts2": end_ms
+        })
+        .to_string();
+
+
+        println!("Publishing trigger payload: {}\n", trigger_payload);
+
+        mqtt_publish("trigger", &trigger_payload).await?;
+
+        println!("Publishing trigger payload: {}\n", trigger_payload);
+        let _ = start_rule("127.0.0.1", 9081, "Vehicle.Speed").await;
+        println!("Publishing trigger payload: {}\n", trigger_payload);
+
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(1));
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                Some(msg) = rx.recv() => {
+                    if let Ok(dp) = parse_history_json(&msg, path) {
+                        results.push(dp);
+                    }
+                }
+                _ = &mut timeout => {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    
+        // mqtt.disconnect().await.unwrap();
+
+        Ok(results)
+        
+    }
+}
+
 impl AuthorizedAccess<'_, '_> {
     #[allow(clippy::too_many_arguments)]
     pub async fn add_entry(
@@ -2612,6 +3002,429 @@ impl Default for DataBroker {
     fn default() -> Self {
         Self::new("", "")
     }
+}
+
+use serde::Serialize;
+use reqwest;
+
+#[derive(Serialize)]
+struct MqttAction {
+    server: String,
+    topic: String,
+    #[serde(rename = "sendSingle")]
+    send_single: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Action {
+    Mqtt { mqtt: MqttAction },
+}
+
+#[derive(Serialize)]
+struct RuleOptions {
+    #[serde(rename = "sendError")]
+    send_error: bool,
+}
+
+#[derive(Serialize)]
+struct Rule {
+    id: String,
+    temp: bool,
+    name: String,
+    sql: String,
+    actions: Vec<Action>,
+    options: RuleOptions,
+}
+
+/// VSS path → physical signal mapping
+fn vss_mapping() -> HashMap<&'static str, &'static str> {
+    HashMap::from([
+        (
+            "Vehicle.Speed", 
+            "ONEBOX_1$ABS_ESP_1_VehicleSpeedVSOSig"
+        ),
+        (
+            "Vehicle.Acceleration.Longitudinal",
+            "ACU_3$ACU_3_LongitudinalAcceleration",
+        ),
+        (
+            "Vehicle.Acceleration.Lateral",
+            "ACU_2$ACU_2_LateralAcceleration",
+        ),
+        (
+            "Vehicle.Chassis.SteeringWheel.Angle",
+            "SAS_1$SAM_1_SteeringAnge",
+        ),
+    ])
+}
+
+// pub fn build_rule_json(
+//     id: &str,
+//     vss_path: &str,
+//     use_mqtt: bool,
+// ) -> Result<String, String> {
+//     let map = vss_mapping();
+//     let real_signal = map
+//         .get(vss_path)
+//         .ok_or_else(|| format!("Unsupported VSS path: {}", vss_path))?;
+// 
+//     let sql = format!(
+//         "SELECT ts, `{real}` AS `{vss}` FROM queryStream",
+//         real = real_signal,
+//         vss = vss_path
+//     );
+// 
+//     let mut actions = Vec::new();
+//     if use_mqtt {
+//         actions.push(Action::Mqtt(MqttAction {
+//             server: "tcp://127.0.0.1:1883".into(),
+//             topic: format!("result/{id}"),
+//             send_single: true,
+//         }));
+//     }
+// 
+//     let rule = Rule {
+//         id: id.into(),
+//         temp: true,
+//         name: "Generated history query".into(),
+//         sql,
+//         actions,
+//         options: RuleOptions { send_error: false },
+//     };
+// 
+//     serde_json::to_string_pretty(&rule)
+//         .map_err(|e| e.to_string())
+// }
+
+
+/// Build a rule JSON object (does NOT send it)
+pub fn build_rule_json(
+    id: &str,
+    vss_path: &str,
+    use_mqtt: bool,
+) -> Result<String, String> {
+    let map = vss_mapping();
+    let real_signal = map
+        .get(vss_path)
+        .ok_or_else(|| format!("Unsupported VSS path: {}", vss_path))?;
+
+    let sql = format!(
+        "SELECT ts, `{real}` AS `{vss}` FROM queryStream",
+        real = real_signal,
+        vss = vss_path
+    );
+
+    let mut actions = Vec::new();
+    if use_mqtt {
+        actions.push(Action::Mqtt {
+            mqtt: MqttAction {
+                server: "tcp://127.0.0.1:1883".into(),
+                topic: format!("result/{id}"),
+                send_single: true,
+            },
+        });
+    }
+
+    let rule = Rule {
+        id: id.into(),
+        temp: true,
+        name: "Generated history query".into(),
+        sql,
+        actions,
+        options: RuleOptions { send_error: false },
+    };
+
+    serde_json::to_string_pretty(&rule)
+        .map_err(|e| e.to_string())
+}
+
+/// Send rule JSON to eKuiper via HTTP API (async)
+///
+/// Example call:
+/// ```
+/// let json = build_rule_json("h1", "Vehicle.Speed", true).unwrap();
+/// send_rule_to_ekuiper(&json).await?;
+/// ```
+// pub async fn send_rule_to_ekuiper(rule_json: &str) -> Result<(), String> {
+//     let client = reqwest::Client::new();
+// 
+//     let resp = client
+//         .post("http://127.0.0.1:9081/rules")
+//         .header("Content-Type", "application/json")
+//         .body(rule_json.to_string())
+//         .send()
+//         .await
+//         .map_err(|e| format!("HTTP request error: {}", e))?;
+//     println!("eKuiper response: {:?}", resp);
+// 
+//     if !resp.status().is_success() {
+//         let status = resp.status();
+//         let text = resp.text().await.unwrap_or_else(|_| "".into());
+//         return Err(format!(
+//             "eKuiper returned error {}: {}",
+//             status, text
+//         ));
+//     }
+// 
+//     Ok(())
+// }
+
+// pub async fn send_rule_to_ekuiper(rule_json: &str) -> Result<(), String> {
+//     let client = reqwest::Client::new();
+// 
+//     let resp = client
+//         .post("http://127.0.0.1:9081/rules")
+//         .header("Content-Type", "application/json")
+//         .body(rule_json.to_string())
+//         .send()
+//         .await
+//         .map_err(|e| format!("HTTP request error: {}", e))?;
+// 
+//     let status = resp.status();
+//     let text = resp.text().await.unwrap_or_else(|_| "<empty body>".into());
+// 
+//     println!("eKuiper status = {}", status);
+//     println!("eKuiper body = {}", text);
+// 
+//     if !status.is_success() {
+//         return Err(format!("eKuiper returned error {}: {}", status, text));
+//     }
+// 
+//     Ok(())
+// }
+
+pub async fn send_rule_to_ekuiper() -> Result<(), String> {
+    let rule_json = json!({
+        "id": "Vehicle.Speed",
+        "temp": true,
+        "name": "Test history query",
+        "sql": "SELECT ts, `ONEBOX_1$ABS_ESP_1_VehicleSpeedVSOSig` AS `Vehicle.Speed` FROM queryStream",
+        "actions": [
+            {
+                "mqtt": {
+                    "server": "tcp://127.0.0.1:1883",
+                    "topic": "history/Vehicle.Speed",
+                    "sendSingle": true
+                }
+            }
+        ],
+        "options": {
+            "sendError": false
+        }
+    })
+    .to_string();
+
+    println!("Rule JSON: {}", rule_json);
+    // --- 3. Create trigger rule (idempotent) ---
+    match create_rule(&rule_json).await {
+        Ok(_) => println!("ruleTrigger created"),
+        Err(e) if e.contains("already exists") => {
+            println!("ruleTrigger already exists, skipping");
+        }
+        Err(e) => return Err(format!("Failed to create ruleTrigger: {}", e)),
+    }
+
+    println!("Trigger stream + rule ensured.");
+    Ok(())
+}
+
+pub async fn start_rule(
+    host: &str,
+    port: u16,
+    rule_name: &str,
+) -> Result<(), String> {
+
+    println!("Starting rule '{}' on eKuiper at {}:{}", rule_name, host, port);
+    let url = format!("http://{}:{}/rules/{}/start", host, port, rule_name);
+
+    let client = reqwest::Client::new();
+
+    let resp = client.post(&url)
+    .send()
+    .await
+    .map_err(|e| format!("HTTP send error: {}", e))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(format!(
+            "Request failed: status={}, body={}",
+            status, body
+        ));
+    }
+
+    println!("Success: {}", body);
+
+    Ok(())
+}
+
+pub async fn send_to_ekuiper(
+    endpoint: &str,
+    payload: &str,
+    host: Option<&str>,
+    port: Option<u16>,
+) -> Result<(), String> {
+    let host = host.unwrap_or("127.0.0.1");
+    let port = port.unwrap_or(9081);
+    let url = format!("http://{}:{}{}", host, port, endpoint);
+
+    println!("[send_to_ekuiper] START");
+    println!("[send_to_ekuiper] URL     = {}", url);
+    println!("[send_to_ekuiper] Payload = {}", payload);
+
+    let client = reqwest::Client::new();
+
+    // ---------- 发送 ----------
+    let resp = match client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(payload.to_string())
+        .send()
+        .await
+    {
+        Ok(r) => {
+            println!("[send_to_ekuiper] SEND OK");
+            r
+        }
+        Err(e) => {
+            println!("[send_to_ekuiper] SEND ERROR = {}", e);
+            return Err(format!("HTTP request error: {}", e));
+        }
+    };
+
+    let status = resp.status();
+    println!("[send_to_ekuiper] HTTP STATUS = {}", status);
+
+    // ---------- 尝试读取 body ----------
+    let body_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[send_to_ekuiper] BODY READ ERROR = {}", e);
+            return Err(format!("Failed to read eKuiper body: {}", e));
+        }
+    };
+
+    let body_string = String::from_utf8_lossy(&body_bytes).to_string();
+
+    println!("[send_to_ekuiper] BODY = {}", body_string);
+
+    // ---------- 错误情况 ----------
+    if !status.is_success() {
+        println!(
+            "[send_to_ekuiper] ERROR: non-success status ({}) with body: {}",
+            status, body_string
+        );
+        return Err(format!("eKuiper returned error {}: {}", status, body_string));
+    }
+
+    println!("[send_to_ekuiper] SUCCESS");
+    Ok(())
+}
+
+
+
+
+// pub async fn send_to_ekuiper(
+//     endpoint: &str,
+//     payload: &str,
+//     host: Option<&str>,
+//     port: Option<u16>,
+// ) -> Result<(), String> {
+//     let host = host.unwrap_or("127.0.0.1");
+//     let port = port.unwrap_or(9081);
+//     let url = format!("http://{}:{}{}", host, port, endpoint);
+// 
+//     let client = reqwest::Client::new();
+//     let resp = client
+//         .post(&url)
+//         .header("Content-Type", "application/json")
+//         .body(payload.to_string())
+//         .send()
+//         .await
+//         .map_err(|e| format!("HTTP request error: {}", e))?;
+// 
+//     let status = resp.status();
+//     let text = resp.text().await.unwrap_or_else(|_| "<empty body>".into());
+// 
+//     println!("eKuiper status = {}", status);
+//     println!("eKuiper body = {}", text);
+// 
+//     if !status.is_success() {
+//         return Err(format!("eKuiper returned error {}: {}", status, text));
+//     }
+// 
+//     // if !resp.status().is_success() {
+//     //     let status = resp.status();
+//     //     let text = resp.text().await.unwrap_or_default();
+//     //     return Err(format!("eKuiper returned error {}: {}", status, text));
+//     // }
+// 
+//     Ok(())
+// }
+
+/// Create a stream with a given SQL
+pub async fn create_stream(sql: &str) -> Result<(), String> {
+    let payload = serde_json::json!({ "sql": sql }).to_string();
+    send_to_ekuiper("/streams", &payload, None, None).await
+}
+
+/// Create a rule with a given JSON payload
+pub async fn create_rule(rule_json: &str) -> Result<(), String> {
+    send_to_ekuiper("/rules", rule_json, None, None).await
+}
+
+use serde_json::json;
+
+/// Initialize long-running trigger stream and trigger rule.
+/// This function is idempotent: calling it multiple times will not recreate existing stream/rule.
+pub async fn ensure_trigger_stream_and_rule() -> Result<(), String> {
+    // --- 1. Create the trigger stream (idempotent) ---
+    let stream_sql = r#"
+        CREATE STREAM triggerStream()
+        WITH (TYPE="mqtt", FORMAT="json", DATASOURCE="trigger", SHARED="true");
+    "#;
+
+    // eKuiper returns error if stream exists, so ignore "already exists" errors
+    match create_stream(stream_sql).await {
+        Ok(_) => println!("triggerStream created"),
+        Err(e) if e.contains("exists") => {
+            println!("triggerStream already exists, skipping");
+        }
+        Err(e) => return Err(format!("Failed to create triggerStream: {}", e)),
+    }
+
+    // --- 2. Build trigger rule JSON ---
+    let rule_json = json!({
+        "id": "ruleTrigger",
+        "name": "Send Query Request",
+        "sql": r#"SELECT "async" as kind, ts1, ts2 FROM triggerStream"#,
+        "actions": [
+            {
+                "nanoquery": {
+                    "url": "tcp://127.0.0.1:10000",
+                    "format": "delimited",
+                    "delimiter": "-",
+                    "fields": ["kind", "ts1", "ts2"],
+                    "sendSingle": true
+                }
+            }
+        ]
+    })
+    .to_string();
+
+    // --- 3. Create trigger rule (idempotent) ---
+    match create_rule(&rule_json).await {
+        Ok(_) => println!("ruleTrigger created"),
+        Err(e) if e.contains("already exists") => {
+            println!("ruleTrigger already exists, skipping");
+        }
+        Err(e) => return Err(format!("Failed to create ruleTrigger: {}", e)),
+    }
+
+    println!("Trigger stream + rule ensured.");
+    Ok(())
 }
 
 #[cfg(test)]
