@@ -1892,7 +1892,7 @@ impl<'a, 'b> AuthorizedAccess<'a, 'b> {
         // println!("Sending rule to ekuiper for history data request\n");
 
         // let _ = send_rule_to_ekuiper(&json).await;
-        let _ = send_rule_to_ekuiper().await;
+        let _ = send_rule_to_ekuiper(path).await;
         println!("Rule sent to ekuiper for history data request\n");
 
 
@@ -1921,7 +1921,7 @@ impl<'a, 'b> AuthorizedAccess<'a, 'b> {
         mqtt_publish("trigger", &trigger_payload).await?;
 
         println!("Publishing trigger payload: {}\n", trigger_payload);
-        let _ = start_rule("127.0.0.1", 9081, "Vehicle.Speed").await;
+        let _ = start_rule("127.0.0.1", 9081, path).await;
         println!("Publishing trigger payload: {}\n", trigger_payload);
 
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(1));
@@ -3054,56 +3054,12 @@ fn vss_mapping() -> HashMap<&'static str, &'static str> {
         ),
         (
             "Vehicle.Chassis.SteeringWheel.Angle",
-            "SAS_1$SAM_1_SteeringAnge",
+            "SAS_1$SAM_1_SteeringAngle",
         ),
     ])
 }
 
-// pub fn build_rule_json(
-//     id: &str,
-//     vss_path: &str,
-//     use_mqtt: bool,
-// ) -> Result<String, String> {
-//     let map = vss_mapping();
-//     let real_signal = map
-//         .get(vss_path)
-//         .ok_or_else(|| format!("Unsupported VSS path: {}", vss_path))?;
-// 
-//     let sql = format!(
-//         "SELECT ts, `{real}` AS `{vss}` FROM queryStream",
-//         real = real_signal,
-//         vss = vss_path
-//     );
-// 
-//     let mut actions = Vec::new();
-//     if use_mqtt {
-//         actions.push(Action::Mqtt(MqttAction {
-//             server: "tcp://127.0.0.1:1883".into(),
-//             topic: format!("result/{id}"),
-//             send_single: true,
-//         }));
-//     }
-// 
-//     let rule = Rule {
-//         id: id.into(),
-//         temp: true,
-//         name: "Generated history query".into(),
-//         sql,
-//         actions,
-//         options: RuleOptions { send_error: false },
-//     };
-// 
-//     serde_json::to_string_pretty(&rule)
-//         .map_err(|e| e.to_string())
-// }
-
-
-/// Build a rule JSON object (does NOT send it)
-pub fn build_rule_json(
-    id: &str,
-    vss_path: &str,
-    use_mqtt: bool,
-) -> Result<String, String> {
+pub async fn send_rule_to_ekuiper(vss_path: &str) -> Result<(), String> {
     let map = vss_mapping();
     let real_signal = map
         .get(vss_path)
@@ -3113,98 +3069,18 @@ pub fn build_rule_json(
         "SELECT ts, `{real}` AS `{vss}` FROM queryStream",
         real = real_signal,
         vss = vss_path
-    );
-
-    let mut actions = Vec::new();
-    if use_mqtt {
-        actions.push(Action::Mqtt {
-            mqtt: MqttAction {
-                server: "tcp://127.0.0.1:1883".into(),
-                topic: format!("result/{id}"),
-                send_single: true,
-            },
-        });
-    }
-
-    let rule = Rule {
-        id: id.into(),
-        temp: true,
-        name: "Generated history query".into(),
-        sql,
-        actions,
-        options: RuleOptions { send_error: false },
-    };
-
-    serde_json::to_string_pretty(&rule)
-        .map_err(|e| e.to_string())
-}
-
-/// Send rule JSON to eKuiper via HTTP API (async)
-///
-/// Example call:
-/// ```
-/// let json = build_rule_json("h1", "Vehicle.Speed", true).unwrap();
-/// send_rule_to_ekuiper(&json).await?;
-/// ```
-// pub async fn send_rule_to_ekuiper(rule_json: &str) -> Result<(), String> {
-//     let client = reqwest::Client::new();
-// 
-//     let resp = client
-//         .post("http://127.0.0.1:9081/rules")
-//         .header("Content-Type", "application/json")
-//         .body(rule_json.to_string())
-//         .send()
-//         .await
-//         .map_err(|e| format!("HTTP request error: {}", e))?;
-//     println!("eKuiper response: {:?}", resp);
-// 
-//     if !resp.status().is_success() {
-//         let status = resp.status();
-//         let text = resp.text().await.unwrap_or_else(|_| "".into());
-//         return Err(format!(
-//             "eKuiper returned error {}: {}",
-//             status, text
-//         ));
-//     }
-// 
-//     Ok(())
-// }
-
-// pub async fn send_rule_to_ekuiper(rule_json: &str) -> Result<(), String> {
-//     let client = reqwest::Client::new();
-// 
-//     let resp = client
-//         .post("http://127.0.0.1:9081/rules")
-//         .header("Content-Type", "application/json")
-//         .body(rule_json.to_string())
-//         .send()
-//         .await
-//         .map_err(|e| format!("HTTP request error: {}", e))?;
-// 
-//     let status = resp.status();
-//     let text = resp.text().await.unwrap_or_else(|_| "<empty body>".into());
-// 
-//     println!("eKuiper status = {}", status);
-//     println!("eKuiper body = {}", text);
-// 
-//     if !status.is_success() {
-//         return Err(format!("eKuiper returned error {}: {}", status, text));
-//     }
-// 
-//     Ok(())
-// }
-
-pub async fn send_rule_to_ekuiper() -> Result<(), String> {
+    ); 
+    let topic = format!("history/{}", vss_path);
     let rule_json = json!({
-        "id": "Vehicle.Speed",
+        "id": vss_path,
         "temp": true,
         "name": "Test history query",
-        "sql": "SELECT ts, `ONEBOX_1$ABS_ESP_1_VehicleSpeedVSOSig` AS `Vehicle.Speed` FROM queryStream",
+        "sql": sql,
         "actions": [
             {
                 "mqtt": {
                     "server": "tcp://127.0.0.1:1883",
-                    "topic": "history/Vehicle.Speed",
+                    "topic": topic,
                     "sendSingle": true
                 }
             }
@@ -3322,47 +3198,6 @@ pub async fn send_to_ekuiper(
     println!("[send_to_ekuiper] SUCCESS");
     Ok(())
 }
-
-
-
-
-// pub async fn send_to_ekuiper(
-//     endpoint: &str,
-//     payload: &str,
-//     host: Option<&str>,
-//     port: Option<u16>,
-// ) -> Result<(), String> {
-//     let host = host.unwrap_or("127.0.0.1");
-//     let port = port.unwrap_or(9081);
-//     let url = format!("http://{}:{}{}", host, port, endpoint);
-// 
-//     let client = reqwest::Client::new();
-//     let resp = client
-//         .post(&url)
-//         .header("Content-Type", "application/json")
-//         .body(payload.to_string())
-//         .send()
-//         .await
-//         .map_err(|e| format!("HTTP request error: {}", e))?;
-// 
-//     let status = resp.status();
-//     let text = resp.text().await.unwrap_or_else(|_| "<empty body>".into());
-// 
-//     println!("eKuiper status = {}", status);
-//     println!("eKuiper body = {}", text);
-// 
-//     if !status.is_success() {
-//         return Err(format!("eKuiper returned error {}: {}", status, text));
-//     }
-// 
-//     // if !resp.status().is_success() {
-//     //     let status = resp.status();
-//     //     let text = resp.text().await.unwrap_or_default();
-//     //     return Err(format!("eKuiper returned error {}: {}", status, text));
-//     // }
-// 
-//     Ok(())
-// }
 
 /// Create a stream with a given SQL
 pub async fn create_stream(sql: &str) -> Result<(), String> {
