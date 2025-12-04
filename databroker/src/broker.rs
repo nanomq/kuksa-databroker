@@ -36,15 +36,14 @@ use crate::types::ExecutionInputImplData;
 use tracing::{debug, info, warn};
 
 use crate::glob;
+use std::sync::atomic::AtomicBool;
 use std::time::UNIX_EPOCH;
-use std::sync::atomic::{AtomicBool};
 
+use reqwest;
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde_json::json;
 use serde_json::Value;
-use rumqttc::{AsyncClient, Event, MqttOptions, QoS, Packet};
 use tokio::sync::Mutex;
-use reqwest;
-
 
 static IS_FIRST: AtomicBool = AtomicBool::new(false);
 
@@ -1570,34 +1569,30 @@ pub struct AuthorizedAccess<'a, 'b> {
 }
 
 fn systemtime_to_millis(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 fn parse_history_json(msg: &str, path: &str) -> Result<Datapoint, ReadError> {
-    let v: Value = serde_json::from_str(msg)
-        .map_err(|_| ReadError::NotFound)?;
+    let v: Value = serde_json::from_str(msg).map_err(|_| ReadError::NotFound)?;
 
-    let ts = v.get("ts")
+    let ts = v
+        .get("ts")
         .and_then(|x| x.as_u64())
         .ok_or_else(|| ReadError::NotFound)?;
 
-    let val = v.get(path)
+    let val = v
+        .get(path)
         .and_then(|x| x.as_f64())
         .ok_or_else(|| ReadError::NotFound)?;
 
     let system_ts = UNIX_EPOCH + Duration::from_millis(ts);
 
     Ok(Datapoint {
-        ts: system_ts.into(), 
+        ts: system_ts.into(),
         source_ts: system_ts.into(),
         value: DataValue::Double(val),
     })
-
 }
-
-
 
 impl From<rumqttc::ClientError> for ReadError {
     fn from(_: rumqttc::ClientError) -> Self {
@@ -1666,12 +1661,12 @@ pub async fn mqtt_publish(topic: &str, payload: &str) -> Result<(), ReadError> {
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
 
     // 启动 eventloop
-    let ev = tokio::spawn(async move {
-        while let Ok(_) = eventloop.poll().await {}
-    });
+    let ev = tokio::spawn(async move { while let Ok(_) = eventloop.poll().await {} });
 
     // publish
-    client.publish(topic, QoS::AtLeastOnce, false, payload).await?;
+    client
+        .publish(topic, QoS::AtLeastOnce, false, payload)
+        .await?;
 
     // 等待发送
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1682,9 +1677,7 @@ pub async fn mqtt_publish(topic: &str, payload: &str) -> Result<(), ReadError> {
     Ok(())
 }
 
-
 type Callback = Arc<dyn Fn(String) + Send + Sync>;
-
 
 #[derive(Clone)]
 pub struct MqttHandle {
@@ -1699,9 +1692,7 @@ impl MqttHandle {
 
         let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
 
-        let callbacks = Arc::new(Mutex::new(
-            HashMap::<String, Callback>::new(),
-        ));
+        let callbacks = Arc::new(Mutex::new(HashMap::<String, Callback>::new()));
 
         let callbacks_clone = callbacks.clone();
 
@@ -1756,20 +1747,18 @@ impl MqttHandle {
     }
 }
 
-
 impl<'a, 'b> AuthorizedAccess<'a, 'b> {
     pub async fn get_history(
         &self,
         path: &str,
         start: std::time::SystemTime,
         end: std::time::SystemTime,
-    ) -> Result<Vec<Datapoint>, ReadError>  {
-
+    ) -> Result<Vec<Datapoint>, ReadError> {
         if !IS_FIRST.load(Ordering::Acquire) {
             IS_FIRST.store(true, Ordering::Release);
             let _ = ensure_trigger_stream_and_rule().await;
         }
-        
+
         let mut results = Vec::new();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -1780,20 +1769,20 @@ impl<'a, 'b> AuthorizedAccess<'a, 'b> {
 
         mqtt.subscribe(&topic, move |msg| {
             let _ = tx.send(msg);
-        }).await;
+        })
+        .await;
 
         let _ = send_rule_to_ekuiper(path).await;
         info!("Rule sent to ekuiper for history data request");
 
         let start_ms = systemtime_to_millis(start);
-        let end_ms   = systemtime_to_millis(end);
+        let end_ms = systemtime_to_millis(end);
 
         let trigger_payload = serde_json::json!({
             "ts1": start_ms,
             "ts2": end_ms
         })
         .to_string();
-
 
         mqtt.publish("trigger", &trigger_payload).await?;
 
@@ -1815,12 +1804,11 @@ impl<'a, 'b> AuthorizedAccess<'a, 'b> {
                 }
             }
         }
-    
+
         mqtt.disconnect().await.unwrap();
         info!("Disconnected MQTT client");
 
         Ok(results)
-        
     }
 }
 
@@ -2883,10 +2871,7 @@ impl Default for DataBroker {
 /// VSS path → physical signal mapping
 fn vss_mapping() -> HashMap<&'static str, &'static str> {
     HashMap::from([
-        (
-            "Vehicle.Speed", 
-            "ONEBOX_1$ABS_ESP_1_VehicleSpeedVSOSig"
-        ),
+        ("Vehicle.Speed", "ONEBOX_1$ABS_ESP_1_VehicleSpeedVSOSig"),
         (
             "Vehicle.Acceleration.Longitudinal",
             "ACU_3$ACU_3_LongitudinalAcceleration",
@@ -2912,7 +2897,7 @@ pub async fn send_rule_to_ekuiper(vss_path: &str) -> Result<(), String> {
         "SELECT ts, `{real}` AS `{vss}` FROM queryStream",
         real = real_signal,
         vss = vss_path
-    ); 
+    );
     let topic = format!("history/{}", vss_path);
     let rule_json = json!({
         "id": vss_path,
@@ -2947,30 +2932,26 @@ pub async fn send_rule_to_ekuiper(vss_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn start_rule(
-    host: &str,
-    port: u16,
-    rule_name: &str,
-) -> Result<(), String> {
-
-    info!("Starting rule '{}' on eKuiper at {}:{}", rule_name, host, port);
+pub async fn start_rule(host: &str, port: u16, rule_name: &str) -> Result<(), String> {
+    info!(
+        "Starting rule '{}' on eKuiper at {}:{}",
+        rule_name, host, port
+    );
     let url = format!("http://{}:{}/rules/{}/start", host, port, rule_name);
 
     let client = reqwest::Client::new();
 
-    let resp = client.post(&url)
-    .send()
-    .await
-    .map_err(|e| format!("HTTP send error: {}", e))?;
+    let resp = client
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP send error: {}", e))?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        return Err(format!(
-            "Request failed: status={}, body={}",
-            status, body
-        ));
+        return Err(format!("Request failed: status={}, body={}", status, body));
     }
 
     info!("Success: {}", body);
@@ -3028,7 +3009,10 @@ pub async fn send_to_ekuiper(
         //     "[send_to_ekuiper] ERROR: non-success status ({}) with body: {}",
         //     status, body_string
         // );
-        return Err(format!("eKuiper returned error {}: {}", status, body_string));
+        return Err(format!(
+            "eKuiper returned error {}: {}",
+            status, body_string
+        ));
     }
 
     // println!("[send_to_ekuiper] SUCCESS");
