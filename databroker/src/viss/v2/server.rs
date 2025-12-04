@@ -214,15 +214,16 @@ impl Viss for Server {
                 })?;
             let broker = self.broker.authorized_access(&permissions);
             // Parse ISO8601 duration (P2DT12H)
-            let duration =
-                parse_iso8601_duration(&history_filter.parameter).ok_or_else(|| GetErrorResponse {
+            let duration = parse_iso8601_duration(&history_filter.parameter).ok_or_else(|| {
+                GetErrorResponse {
                     request_id: request_id.clone(),
                     ts: SystemTime::now().into(),
                     error: Error::InvalidFilter(format!(
                         "Invalid ISO8601 duration: {}",
                         history_filter.parameter
                     )),
-                })?;
+                }
+            })?;
             let now = chrono::Utc::now();
             let start_ts = now - duration;
             let history = broker
