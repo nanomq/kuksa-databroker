@@ -122,6 +122,20 @@ async fn read_metadata_file(
     let buffered = std::io::BufReader::new(metadata_file);
     let entries = vss::parse_vss_from_reader(buffered)?;
 
+    broker::init_root(filename)?;
+
+    // let file = File::open(filename)?;
+    // let json: Value = serde_json::from_reader(file)?;
+
+    // let node = find_vss_node(&json, "Vehicle.Acceleration.Lateral")
+    // .expect("path not found");
+
+    // if let Some(qname) = get_qualified_name(node) {
+    //     println!("qualifiedName = {}", qname);
+    // } else {
+    //     println!("No qualifiedName found");
+    // }
+
     for (path, entry) in entries {
         debug!("Adding VSS datapoint {}", path);
 

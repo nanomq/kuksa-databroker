@@ -44,7 +44,11 @@ use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde_json::json;
 use serde_json::Value;
 use tokio::sync::Mutex;
+use std::sync::OnceLock;
+use std::fs::File;
 
+
+static ROOT: OnceLock<Value> = OnceLock::new();
 static IS_FIRST: AtomicBool = AtomicBool::new(false);
 
 const MAX_SUBSCRIBE_BUFFER_SIZE: usize = 1000;
@@ -2868,6 +2872,42 @@ impl Default for DataBroker {
     }
 }
 
+
+pub fn init_root(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(filename)?;
+    let v: Value = serde_json::from_reader(file)?;
+    
+    ROOT.set(v)
+        .map_err(|_| "ROOT 已经被初始化".to_string())?;
+    
+    Ok(())
+}
+
+fn find_vss_node<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+
+    for (i, part) in path.split('.').enumerate() {
+        if i == 0 {
+            current = current.get(part)?;
+            continue;
+        }
+
+        current = current
+            .get("children")?
+            .get(part)?;
+    }
+
+    Some(current)
+}
+
+fn get_qualified_name(node: &Value) -> Option<String> {
+    node.get("sig2vss")?
+        .get("qualifiedName")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+
 /// VSS path → physical signal mapping
 fn vss_mapping() -> HashMap<&'static str, &'static str> {
     HashMap::from([
@@ -2889,15 +2929,37 @@ fn vss_mapping() -> HashMap<&'static str, &'static str> {
 
 pub async fn send_rule_to_ekuiper(vss_path: &str) -> Result<(), String> {
     let map = vss_mapping();
-    let real_signal = map
-        .get(vss_path)
-        .ok_or_else(|| format!("Unsupported VSS path: {}", vss_path))?;
 
-    let sql = format!(
-        "SELECT ts, `{real}` AS `{vss}` FROM queryStream",
-        real = real_signal,
-        vss = vss_path
-    );
+    // let file = File::open(filename)?;
+    // let json: Value = serde_json::from_reader(file)?;
+    let root = ROOT.get().expect("ROOT not initialized");
+
+    let node = find_vss_node(&root, vss_path)
+    .expect(&format!("Path not found: {}", vss_path));
+    let mut sql = String::new();
+
+    if let Some(qname) = get_qualified_name(node) {
+
+        sql = format!(
+            "SELECT ts, `{real}` AS `{vss}` FROM queryStream",
+            real = qname,
+            vss = vss_path
+        );
+        println!("qualifiedName = {}", qname);
+    }
+
+
+
+
+    // let real_signal = map
+    //     .get(vss_path)
+    //     .ok_or_else(|| format!("Unsupported VSS path: {}", vss_path))?;
+
+    // let sql = format!(
+    //     "SELECT ts, `{real}` AS `{vss}` FROM queryStream",
+    //     real = real_signal,
+    //     vss = vss_path
+    // );
     let topic = format!("history/{}", vss_path);
     let rule_json = json!({
         "id": vss_path,
