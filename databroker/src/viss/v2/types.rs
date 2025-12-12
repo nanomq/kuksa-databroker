@@ -200,6 +200,8 @@ pub enum Filter {
     Paths(PathsFilter),
     #[serde(rename = "timebased")]
     Timebased(TimebasedFilter),
+    #[serde(rename = "history")]
+    History(HistoryFilter),
 }
 
 #[derive(Deserialize)]
@@ -226,6 +228,11 @@ pub struct Period {
     pub period: u32,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryFilter {
+    pub parameter: String,
+}
 // Unique id value specified by the client. Returned by the server in the
 // response and used by the client to link the request and response messages.
 // The value MAY be an integer or a Universally Unique Identifier (UUID).
@@ -265,11 +272,18 @@ pub struct Timestamp {
 }
 
 #[derive(Serialize)]
+pub struct DataObjectHistory {
+    pub path: Path,
+    pub dp: Vec<DataPoint>,
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
 pub enum Data {
     Object(DataObject),
     #[allow(dead_code)]
     Array(Vec<DataObject>),
+    History(DataObjectHistory),
 }
 
 #[derive(Serialize)]
@@ -323,6 +337,14 @@ pub struct SensorEntry {
     pub min: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<Value>,
+}
+pub struct Duration {
+    pub year: f32,
+    pub month: f32,
+    pub day: f32,
+    pub hour: f32,
+    pub minute: f32,
+    pub second: f32,
 }
 
 #[derive(Serialize)]
@@ -418,6 +440,7 @@ pub enum Error {
     InternalServerError,
     NotImplemented,
     ServiceUnavailable,
+    InvalidFilter(String),
 }
 
 impl From<Error> for ErrorSpec {
@@ -509,6 +532,11 @@ impl From<Error> for ErrorSpec {
                 number: 503,
                 reason: "service_unavailable".into(),
                 message: "The server is temporarily unable to handle the request.".into(),
+            },
+            Error::InvalidFilter(_msg) => ErrorSpec {
+                number: 504,
+                reason: "filter_invalid.".into(),
+                message: "Filter is invalid.".into(),
             },
         }
     }

@@ -31,6 +31,8 @@ use crate::{
     broker::{self, AuthorizedAccess, UpdateError},
     glob::Matcher,
     permissions::{self, Permissions},
+    viss::history::HistoryProvider,
+    viss::history::HistoryError,
 };
 
 use super::{conversions, types::*};
@@ -74,14 +76,20 @@ impl Drop for SubscriptionHandle {
 pub struct Server {
     broker: broker::DataBroker,
     authorization: Authorization,
+    history: Arc<dyn HistoryProvider>,
     subscriptions: Arc<RwLock<HashMap<SubscriptionId, SubscriptionHandle>>>,
 }
 
 impl Server {
-    pub fn new(broker: broker::DataBroker, authorization: Authorization) -> Self {
+    pub fn new(
+        broker: broker::DataBroker,
+        authorization: Authorization,
+        history: Arc<dyn HistoryProvider>,
+    ) -> Self {
         Self {
             broker,
             authorization,
+            history,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -205,6 +213,46 @@ impl Viss for Server {
                     },
                 })
             }
+        } else if let Some(Filter::History(history_filter)) = &request.filter {
+            let permissions = resolve_permissions(&self.authorization, &request.authorization)
+                .map_err(|error| GetErrorResponse {
+                    request_id: request_id.clone(),
+                    error,
+                    ts: SystemTime::now().into(),
+                })?;
+            // Parse ISO8601 duration (P2DT12H)
+            let duration = parse_iso8601_duration(&history_filter.parameter).ok_or_else(|| {
+                GetErrorResponse {
+                    request_id: request_id.clone(),
+                    ts: SystemTime::now().into(),
+                    error: Error::InvalidFilter(format!(
+                        "Invalid ISO8601 duration: {}",
+                        history_filter.parameter
+                    )),
+                }
+            })?;
+            let now = chrono::Utc::now();
+            let start_ts = now - duration;
+            let history = self.history
+                .get_history(request.path.as_ref(), start_ts.into(), now.into())
+                .await
+                .map_err(|err| GetErrorResponse {
+                    request_id: request_id.clone(),
+                    ts: SystemTime::now().into(),
+                    error: match err {
+                        HistoryError::NotFound => Error::NotImplemented,
+                        HistoryError::BackendUnavailable => Error::ServiceUnavailable,
+                        HistoryError::InternalError => Error::InternalServerError,
+                    },
+                })?;
+            let dps: Vec<DataPoint> = history.into_iter().map(DataPoint::from).collect();
+            return Ok(GetSuccessResponse::Data(DataResponse {
+                request_id,
+                data: Data::History(DataObjectHistory {
+                    path: request.path,
+                    dp: dps,
+                }),
+            }));
         } else {
             let permissions = resolve_permissions(&self.authorization, &request.authorization)
                 .map_err(|error| GetErrorResponse {
@@ -564,4 +612,25 @@ fn insert_entry(entries: &mut HashMap<String, MetadataEntry>, path: &str, entry:
             entries.insert(path.to_owned(), entry);
         }
     }
+}
+
+fn parse_iso8601_duration(s: &str) -> Option<chrono::Duration> {
+    let d = iso8601_duration::Duration::parse(s).ok()?;
+
+    let mut duration = chrono::Duration::zero();
+
+    if d.day > 0.0 {
+        duration = duration + chrono::Duration::days(d.day as i64);
+    }
+    if d.hour > 0.0 {
+        duration = duration + chrono::Duration::hours(d.hour as i64);
+    }
+    if d.minute > 0.0 {
+        duration = duration + chrono::Duration::minutes(d.minute as i64);
+    }
+    if d.second > 0.0 {
+        duration = duration + chrono::Duration::seconds(d.second as i64);
+    }
+
+    Some(duration)
 }

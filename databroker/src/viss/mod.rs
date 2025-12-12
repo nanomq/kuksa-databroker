@@ -13,3 +13,4 @@
 
 pub mod server;
 pub mod v2;
+pub mod history;

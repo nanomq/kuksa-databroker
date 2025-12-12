@@ -24,8 +24,11 @@ use tracing::{debug, error, info, trace};
 use futures::{channel::mpsc, Sink};
 use futures::{stream::StreamExt, Stream};
 
+use std::sync::Arc;
+
 use crate::authorization::Authorization;
 use crate::broker;
+use crate::viss::history::no_history::NoHistory;
 
 use super::v2::{self, server::Viss};
 
@@ -126,8 +129,9 @@ async fn handle_viss_v2<W, R>(
     // Create a multi producer / single consumer channel, where the
     // single consumer will write to the socket.
     let (sender, receiver) = mpsc::channel::<Message>(10);
+    let no_history =Arc::new(NoHistory);
 
-    let server = v2::server::Server::new(broker, authorization);
+    let server = v2::server::Server::new(broker, authorization, no_history);
     let mut write_task = tokio::spawn(async move {
         let _ = receiver.map(Ok).forward(write).await;
     });
